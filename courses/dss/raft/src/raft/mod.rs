@@ -1,7 +1,8 @@
-use std::sync::mpsc::{channel, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 
 use futures::channel::mpsc::UnboundedSender;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 pub mod config;
@@ -16,6 +17,13 @@ use crate::proto::raftpb::*;
 use rand::Rng;
 use std::time::Duration;
 use std::{thread, time};
+
+const TIMEOUT_LOW_BOUND: u64 = 150;
+const TIMEOUT_HIGH_BOUND: u64 = 200;
+const ELECTION_LOW_BOUND: u64 = 350;
+const ELECTION_HIGH_BOUND: u64 = 500;
+const HEART_BEAT_LOW_BOUND: u64 = 50;
+const HEART_BEAT_HIGH_BOUND: u64 = 80;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -69,6 +77,9 @@ pub struct Raft {
     pub apply_ch: UnboundedSender<ApplyMsg>,
 
     voted_for: Option<u64>,
+
+    leader_last_contact: Option<time::Instant>,
+    current_leader: Option<u64>,
 }
 
 impl Raft {
@@ -94,9 +105,10 @@ impl Raft {
             persister,
             me,
             state: Arc::default(),
-            //  voted_for: None,
             apply_ch,
             voted_for: None,
+            leader_last_contact: None,
+            current_leader: None,
         };
 
         // initialize from state persisted before a crash
@@ -170,6 +182,7 @@ impl Raft {
     /// look at the comments in ../labrpc/src/lib.rs for more details.
     fn send_request_vote(
         &self,
+        me: usize,
         server: usize,
         args: RequestVoteArgs,
         tx: Sender<Result<RequestVoteReply>>,
@@ -177,10 +190,15 @@ impl Raft {
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
         peer.spawn(async move {
+            let tx_clone = tx.to_owned();
             let res = peer_clone.request_vote(&args).await.map_err(Error::Rpc);
-            match tx.send(res) {
+            debug!(
+                "[node{}] has received a response from node{}: {:?}",
+                me, server, res
+            );
+            match tx_clone.send(res) {
                 Ok(_) => {}
-                Err(err) => unimplemented!("cannot send message: {}", err.to_string()),
+                Err(err) => warn!("cannot send request vote message: {}", err.to_string()),
             }
         });
     }
@@ -194,10 +212,11 @@ impl Raft {
         let peer = &self.peers[server];
         let peer_clone = peer.clone();
         peer.spawn(async move {
+            let tx_clone = tx.to_owned();
             let res = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
-            match tx.send(res) {
+            match tx_clone.send(res) {
                 Ok(_) => {}
-                Err(err) => unimplemented!("cannot send message: {}", err.to_string()),
+                Err(err) => warn!("cannot send append message: {}", err.to_string()),
             }
         });
     }
@@ -252,204 +271,442 @@ impl Raft {
 pub struct Node {
     raft: Arc<Mutex<Raft>>,
     election_timeout: time::Duration,
+    heartbeat_thread_started: Arc<AtomicBool>,
+    election_thread_started: Arc<AtomicBool>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
-        let election_timeout = rand::thread_rng().gen_range(150, 350);
+        let election_timeout = rand::thread_rng().gen_range(TIMEOUT_LOW_BOUND, TIMEOUT_HIGH_BOUND);
         let node = Node {
             raft: Arc::new(Mutex::new(raft)),
             election_timeout: Duration::from_millis(election_timeout),
+            election_thread_started: Arc::from(AtomicBool::new(false)),
+            heartbeat_thread_started: Arc::from(AtomicBool::new(false)),
         };
 
-        Node::create_vote_thread(node.clone());
+        Node::create_election_thread(node.clone());
         node
     }
 
-    pub fn create_vote_thread(node: Node) {
-        let mut term = node.term();
-        let mut iteration_without_passing_follower = 0;
-        thread::spawn(move || loop {
-            let peers;
-            let me;
-            {
-                let mut guard = match node.raft.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-
-                // reset state
-                guard.set_state(term, false, false, false);
-
-                peers = guard.peers.clone();
-                me = guard.me;
-            }
-
-            let election_timeout = Duration::from_millis(rand::thread_rng().gen_range(300, 500));
-            //let election_timeout = Duration::from_millis(((me * 5 * 100) + 100) as u64);
-            let now = time::Instant::now();
-            info!(
-                "node{} at term={} will vote in {:#?}",
-                me, term, election_timeout
-            );
-
-            thread::sleep(election_timeout);
-
-            {
-                let mut guard = match node.raft.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-
-                if guard.state.is_follower {
-                    info!("exiting voting thread because node{} is a follower", me);
-                    return;
+    pub fn create_heartbeat_thread(node: Node) {
+        if node.heartbeat_thread_started.load(Ordering::Relaxed) {
+            warn!("node has already started an election thread");
+            return;
+        }
+        thread::spawn(move || {
+            node.heartbeat_thread_started.store(true, Ordering::Relaxed);
+            loop {
+                let peers;
+                let me;
+                let term;
+                let is_leader;
+                let is_follower;
+                {
+                    let guard = match node.raft.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    peers = guard.peers.to_owned();
+                    me = guard.me;
+                    term = guard.state.term;
+                    is_leader = guard.state.is_leader;
+                    is_follower = guard.state.is_follower;
                 }
 
-                match guard.voted_for {
-                    None => {}
-                    Some(voted_for) => {
-                        if iteration_without_passing_follower >= 1 {
-                            info!("not an follower and too much iteration, resetting things");
-                            iteration_without_passing_follower = 0;
-                            guard.set_vote_for(None)
-                        } else {
-                            iteration_without_passing_follower += 1;
-                            info!("node{} has already voted for {}, continuing", me, voted_for);
+                let heartbeat_timeout = Duration::from_millis(
+                    rand::thread_rng().gen_range(HEART_BEAT_LOW_BOUND, HEART_BEAT_HIGH_BOUND),
+                );
+                let now = time::Instant::now();
+                debug!(
+                    "[node{}] at term={} will send/check heartbeat in {:#?}. Is leader: {}, is follower: {}",
+                    me, term, heartbeat_timeout,is_leader, is_follower
+                );
+                thread::sleep(heartbeat_timeout);
+
+                let is_leader;
+                let is_follower;
+                {
+                    let guard = match node.raft.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    is_leader = guard.state.is_leader;
+                    is_follower = guard.state.is_follower;
+                }
+                if is_leader {
+                    debug!(
+                        "[node{}] at term={} is sending heartbeats after {:#?}",
+                        me,
+                        term,
+                        now.elapsed()
+                    );
+                    let responses = Node::broadcast_leader_states(node.to_owned(), term, me, peers);
+                    let mut errors = 0;
+                    for response in responses {
+                        if let Err(err) = response {
+                            warn!("[node{}] cannot contact a node: {}", me, err);
+                            errors += 1;
                         }
-                        continue;
+                    }
+
+                    if errors > 1 {
+                        debug!(
+                            "[node{}] too much nodes ({}) in errors, exiting as a leader",
+                            me, errors
+                        );
+                        node.heartbeat_thread_started
+                            .store(false, Ordering::Relaxed);
+                        Node::create_election_thread(node);
+                        return;
                     }
                 }
 
-                term += 1;
-                guard.set_state(term, false, true, false);
-                guard.set_vote_for(Some(me as u64));
-            }
-
-            info!(
-                "node{} at term={} is voting for himself after {:#?}",
-                me,
-                term,
-                now.elapsed()
-            );
-
-            let (tx, rx) = channel();
-            for peer_number in 0..peers.len() {
-                let tx_clone = tx.clone();
-                if peer_number != me {
-                    info!("node{} sending RequestVoteArgs to {}", me, peer_number);
-                    let args = RequestVoteArgs {
-                        candidate_id: me as u64,
-                        term,
-                    };
-
+                // we need to check when did we received news from leader
+                if is_follower {
+                    let last_contact;
                     {
                         let guard = match node.raft.lock() {
                             Ok(guard) => guard,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        guard.send_request_vote(peer_number, args, tx_clone);
+                        last_contact = guard.leader_last_contact;
                     }
-                }
-            }
-
-            // retrieve results
-            let mut request_vote_results = vec![];
-            while request_vote_results.len() != (peers.len() - 1) {
-                match rx.try_recv() {
-                    Ok(result) => {
-                        request_vote_results.push(result);
-                    }
-                    Err(err) => match err {
-                        TryRecvError::Empty => {}
-                        TryRecvError::Disconnected => panic!("TryRecvError::Disconnected"),
-                    },
-                }
-            }
-
-            info!(
-                "node{} received all results: {:?}",
-                me,
-                request_vote_results.clone()
-            );
-            // he voted for himself
-            let mut voted_granted = 1;
-            let mut ko = 0;
-            let mut vote_not_granted = 0;
-            let majority = 2;
-
-            for result in request_vote_results {
-                match result {
-                    Ok(response) => {
-                        if response.vote_granted {
-                            voted_granted += 1
-                        } else {
-                            vote_not_granted += 1
+                    match last_contact {
+                        None => {
+                            warn!(
+                                "node{} received no news from leader, moving into election mode",
+                                me
+                            );
+                            node.heartbeat_thread_started
+                                .store(false, Ordering::Relaxed);
+                            Node::create_election_thread(node);
+                            return;
+                        }
+                        Some(last_contact) => {
+                            let limit = Duration::from_millis(3 * HEART_BEAT_HIGH_BOUND);
+                            if last_contact.elapsed() > limit {
+                                warn!(
+                                    "[node{}] has an old news ({:?}) (limit is {:?}) from leader, moving into election mode",
+                                    me, last_contact.elapsed(), limit
+                                );
+                                node.heartbeat_thread_started
+                                    .store(false, Ordering::Relaxed);
+                                Node::create_election_thread(node);
+                                return;
+                            } else {
+                                debug!(
+                                    "[node{}] term={} has received news from his leader",
+                                    me, term
+                                );
+                            }
                         }
                     }
-                    Err(_) => ko += 1,
+                }
+
+                if !is_leader && !is_follower {
+                    node.heartbeat_thread_started
+                        .store(false, Ordering::Relaxed);
+                    warn!("[node{}] is no leader/follower, exiting heartbeat mode", me);
+                    return;
                 }
             }
+        });
+    }
 
-            if voted_granted >= majority {
-                info!(
-                    "we have a new leader {} with {}/{} at term {}",
-                    me, voted_granted, majority, term
-                );
+    pub fn create_election_thread(node: Node) {
+        let mut term = node.term();
+        let me = node.get_me();
+        if node.election_thread_started.load(Ordering::Relaxed) {
+            warn!("[node{}] is already started an election thread", me);
+            return;
+        }
+
+        debug!(
+            "[node{}] starting election thread, initial term is {}",
+            me, term
+        );
+        thread::spawn(move || {
+            node.election_thread_started.store(true, Ordering::Relaxed);
+            loop {
+                let peers;
+                let me;
                 {
+                    term += 1;
                     let mut guard = match node.raft.lock() {
                         Ok(guard) => guard,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    guard.set_state(term, true, false, false);
+
+                    // reset state
+                    guard.set_state(term, false, false, false);
+                    guard.voted_for = None;
+                    guard.current_leader = None;
+
+                    peers = guard.peers.clone();
+                    me = guard.me;
                 }
 
-                // broadcasting leader state
-                let (tx, rx) = channel();
-                for peer_number in 0..peers.len() {
-                    let tx_clone = tx.clone();
-                    if peer_number != me {
-                        info!("node{} sending AppendEntry to {}", me, peer_number);
-                        let args = AppendEntryRequest {
-                            leader_id: me as u64,
-                            term,
-                        };
+                let election_timeout = Duration::from_millis(
+                    rand::thread_rng().gen_range(ELECTION_LOW_BOUND, ELECTION_HIGH_BOUND),
+                );
+                let now = time::Instant::now();
+                debug!(
+                    "[node{}] at term={} will vote in {:#?}",
+                    me, term, election_timeout
+                );
 
+                thread::sleep(election_timeout);
+
+                let is_follower;
+                let voted_for;
+                {
+                    let guard = match node.raft.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+
+                    is_follower = guard.state.is_follower;
+                    voted_for = guard.voted_for;
+                }
+
+                if is_follower {
+                    debug!(
+                        "[node{}] exiting election thread because he is a follower",
+                        me
+                    );
+                    node.election_thread_started.store(false, Ordering::Relaxed);
+                    return;
+                }
+
+                match voted_for {
+                    None => {
+                        {
+                            let mut guard = match node.raft.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            guard.set_state(term, false, true, false);
+                            guard.set_vote_for(Some(me as u64));
+                            debug!(
+                                "[node{}] at term={} is voting for himself after {:#?}",
+                                me,
+                                term,
+                                now.elapsed()
+                            );
+                        }
+                        let vote_results = Node::brodcast_request_votes(
+                            me,
+                            term,
+                            node.to_owned(),
+                            peers.to_owned(),
+                        );
+                        let is_leader = Node::handle_vote_responses(
+                            node.to_owned(),
+                            term,
+                            me,
+                            vote_results.to_owned(),
+                        );
+                        if !is_leader {
+                            debug!(
+                                "[node{}] cannot become a leader, starting a new election",
+                                me
+                            );
+                            continue;
+                        } else {
+                            {
+                                let mut guard = match node.raft.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                guard.set_state(term, true, false, false);
+                            }
+                            debug!("[node{}] is now leader and has broadcast his status", me);
+                            node.election_thread_started.store(false, Ordering::Relaxed);
+                            Node::create_heartbeat_thread(node);
+                            return;
+                        }
+                    }
+                    Some(voted_for) => {
+                        debug!(
+                            "[node{}] has already voted for node{} before sending his proposal, sleeping for {:?}",
+                            me, voted_for, election_timeout
+                        );
+                        thread::sleep(election_timeout);
+                        let is_follower;
                         {
                             let guard = match node.raft.lock() {
                                 Ok(guard) => guard,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
-                            guard.send_append_entry_request(peer_number, args, tx_clone);
+                            debug!("[node{}] has slept, state={:?}", me, guard.state);
+                            is_follower = guard.state.is_follower;
+                        }
+                        if is_follower {
+                            debug!("[node{}] has become a follower, exiting", me);
+                            node.election_thread_started.store(false, Ordering::Relaxed);
+                            return;
                         }
                     }
                 }
-
-                // retrieve results
-                let mut append_entries_results = vec![];
-                while append_entries_results.len() != (peers.len() - 1) {
-                    match rx.try_recv() {
-                        Ok(result) => {
-                            append_entries_results.push(result);
-                        }
-                        Err(err) => match err {
-                            TryRecvError::Empty => {}
-                            TryRecvError::Disconnected => panic!("TryRecvError::Disconnected"),
-                        },
-                    }
-                }
-
-                dbg!(append_entries_results);
-
-                return;
-            } else {
-                info!(
-                    "not enough answers for {}, we have {} ko and {} ungranted votes for a majority of {}!",
-                    me, ko, vote_not_granted, majority
-                );
             }
         });
+    }
+
+    pub fn broadcast_leader_states(
+        node: Node,
+        term: u64,
+        me: usize,
+        peers: Vec<RaftClient>,
+    ) -> Vec<Result<AppendEntryResponse>> {
+        let (tx, rx) = channel();
+        for peer_number in 0..peers.len() {
+            if peer_number != me {
+                debug!("[node{}] sending AppendEntry to {}", me, peer_number);
+                let args = AppendEntryRequest {
+                    leader_id: me as u64,
+                    term,
+                };
+
+                {
+                    let guard = match node.raft.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.send_append_entry_request(peer_number, args, tx.to_owned());
+                }
+            }
+        }
+
+        // retrieve results
+        let mut results = vec![];
+        let now = time::Instant::now();
+        while results.len() != (peers.len() - 1) {
+            if now.elapsed().as_millis() > Duration::from_millis(5).as_millis() {
+                debug!(
+                    "[node{}] timeout receiving AppendEntryResponse after {:?}",
+                    me,
+                    now.elapsed()
+                );
+                results.push(Err(Error::Rpc(labrpc::Error::Timeout)));
+            } else if let Ok(result) = rx.try_recv() {
+                results.push(result);
+            }
+        }
+        results
+    }
+
+    pub fn brodcast_request_votes(
+        me: usize,
+        term: u64,
+        node: Node,
+        peers: Vec<RaftClient>,
+    ) -> Vec<Result<RequestVoteReply>> {
+        let (tx, rx) = channel();
+        for peer_number in 0..peers.len() {
+            let tx_clone = tx.clone();
+            if peer_number != me {
+                debug!(
+                    "[node{}] trying to send RequestVoteArgs to {}",
+                    me, peer_number
+                );
+                let args = RequestVoteArgs {
+                    candidate_id: me as u64,
+                    term,
+                };
+
+                {
+                    let guard = match node.raft.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    debug!("[node{}] sending RequestVoteArgs to {}", me, peer_number);
+                    guard.send_request_vote(me, peer_number, args, tx_clone);
+                }
+            }
+        }
+
+        // retrieve results
+        let mut request_vote_results = vec![];
+        let now = time::Instant::now();
+        while request_vote_results.len() != (peers.len() - 1) {
+            if now.elapsed().as_millis() > Duration::from_millis(5).as_millis() {
+                debug!(
+                    "[node{}] timeout receiving RequestVoteReply after {:?}",
+                    me,
+                    now.elapsed()
+                );
+                request_vote_results.push(Err(Error::Rpc(labrpc::Error::Timeout)));
+            } else if let Ok(result) = rx.try_recv() {
+                request_vote_results.push(result);
+            }
+        }
+        request_vote_results
+    }
+
+    pub fn handle_vote_responses(
+        node: Node,
+        term: u64,
+        me: usize,
+        votes_results: Vec<Result<RequestVoteReply>>,
+    ) -> bool {
+        debug!(
+            "[node{}] term={} received all results: {:?}",
+            me, term, votes_results
+        );
+
+        // he voted for himself
+        let mut voted_granted = 1;
+        let mut ko = 0;
+        let mut vote_not_granted = 0;
+        let majority = 2;
+
+        for result in votes_results {
+            match result {
+                Ok(response) => {
+                    if response.vote_granted && response.term == term {
+                        voted_granted += 1
+                    } else {
+                        vote_not_granted += 1
+                    }
+                }
+                Err(_) => ko += 1,
+            }
+        }
+
+        if voted_granted >= majority {
+            debug!(
+                "[node{}] is now leader with {}/{} at term {}",
+                me, voted_granted, majority, term
+            );
+            let peers;
+            {
+                let guard = match node.raft.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                peers = guard.peers.to_owned();
+            }
+
+            let mut success = 0;
+
+            let responses = Node::broadcast_leader_states(node, term, me, peers);
+            for response in responses {
+                if let Ok(resp) = response {
+                    if resp.success {
+                        success += 1;
+                    }
+                }
+            }
+            success >= 1
+        } else {
+            debug!(
+                "[node{}] has not received enough answers, we have {} ko and {} ungranted votes for a majority of {}!",
+                me, ko, vote_not_granted, majority
+            );
+            false
+        }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -536,7 +793,7 @@ impl RaftService for Node {
     //
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, request: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        info!("inside request_vote rpc with req={:#?}", request);
+        debug!("inside request_vote rpc with req={:?}", request);
         let mut result = RequestVoteReply {
             term: 0,
             vote_granted: false,
@@ -549,49 +806,49 @@ impl RaftService for Node {
                 Err(poisoned) => poisoned.into_inner(),
             };
 
-            info!(
-                "node{} has acquired his rpc lock at term {}",
-                guard.me, guard.state.term
-            );
-
-            result.term = guard.state.term;
+            result.term = request.term;
             let voted_for = guard.get_vote_for();
             me = guard.me;
 
-            dbg!(me, request.term, result.term, guard.state.is_candidate);
+            debug!(
+                "[node{}] received a request vote! current_term:{}, request_term:{}, candidate_id:{}, voted_for:{:?}",
+                me, guard.state.term, request.term, request.candidate_id, voted_for
+            );
+
             match voted_for {
                 None => {
-                    if result.term < request.term && !guard.state.is_candidate {
-                        info!(
-                            "node{} is voting for {}! current_term={}, request_term={}",
+                    if result.term <= request.term {
+                        debug!(
+                            "[node{}] is voting for {}! current_term={}, request_term={}",
                             me, request.candidate_id, guard.state.term, request.term
                         );
                         result.vote_granted = true;
                         guard.set_vote_for(Some(request.candidate_id));
-                        let is_candidate = guard.state.is_candidate;
-                        let is_follower = guard.state.is_follower;
-                        guard.set_state(request.term, false, is_candidate, is_follower);
+                        // let is_candidate = guard.state.is_candidate;
+                        // let is_follower = guard.state.is_follower;
+                        // guard.set_state(request.term, false, is_candidate, is_follower);
                     }
                 }
                 Some(voted_for) => {
-                    info!("node{} has voted for {}!", me, voted_for);
+                    debug!(
+                        "[node{}] has already voted for {} during the term {}!",
+                        me, voted_for, guard.state.term
+                    );
                 }
             }
         }
-        info!(
-            "node{} has released his rpc lock, will respond {:#?}",
-            me, result
-        );
         labrpc::Result::Ok(result)
     }
 
     async fn append_entries(&self, req: AppendEntryRequest) -> labrpc::Result<AppendEntryResponse> {
-        info!("inside append_entries rpc with req={:#?}", req);
+        debug!("inside append_entries rpc with req={:?}", req);
 
         let result = AppendEntryResponse {
             term: 0,
             success: true,
         };
+
+        let me;
 
         {
             let mut guard = match self.raft.lock() {
@@ -599,9 +856,42 @@ impl RaftService for Node {
                 Err(poisoned) => poisoned.into_inner(),
             };
 
+            me = guard.me;
+
+            debug!(
+                "[node{}] has received an append_entries={:?} with state={:?} and voted_for={:?}",
+                me, req, guard.state, guard.voted_for
+            );
+
             if !guard.state.is_follower && guard.voted_for.is_some() {
-                info!("setting as follower");
-                guard.set_state(req.term, false, false, true);
+                if guard.voted_for.unwrap() == req.leader_id {
+                    debug!(
+                        "[node{}] setting node as a follower: {:?}, {:?}",
+                        me, guard.state, guard.voted_for
+                    );
+                    guard.current_leader = Some(req.leader_id);
+                    guard.set_state(req.term, false, false, true);
+                    guard.leader_last_contact = Some(time::Instant::now());
+                    Node::create_heartbeat_thread(self.to_owned());
+                } else {
+                    warn!(
+                        "[node{}] received something not from what we voted for{:?}: {:?}",
+                        me, guard.voted_for, guard.state
+                    );
+                }
+            }
+
+            if guard.state.is_follower
+                && guard.current_leader.is_some()
+                && guard.current_leader.unwrap() != req.leader_id
+            {
+                warn!("[node{}] received a rpc proposal from another leader", me);
+            }
+            if guard.state.is_follower
+                && guard.current_leader.is_some()
+                && guard.current_leader.unwrap() == req.leader_id
+            {
+                guard.leader_last_contact = Some(time::Instant::now());
             }
         }
 
